@@ -3,5 +3,8 @@
 *.fasl
 #*
 *#
+.#*
 /sqlitestore
 *.data
+benchmark.out
+
