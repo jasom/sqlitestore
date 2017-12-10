@@ -6,10 +6,10 @@
 (defconstant +hash+ 'ironclad:blake2/256)
 (defconstant +initial-a+ 1)
 (defconstant +initial-b+ 2)
-(defconstant +min-length+ 256)
+(defconstant +min-length+ 16)
 (defconstant +max-length+ (* 1024 1024))
 
-(defun compress (x) (zstd:compress x 1))
+(defun compress (x) (zstd:compress x 6))
 (defun decompress (x) (zstd::decompress x +max-length+))
 ;;(defun compress (x) x)
 ;;(defun decompress (x) x)
@@ -41,46 +41,28 @@
     (incf (buffered-reader-pos in))))
 	   
 
-;(declaim (inline hash))
+(declaim (inline hash))
 (defun hash (seq)
-  (declare (notinline ironclad:digest-sequence))
   (ironclad:digest-sequence +hash+ seq))
 
 (declaim (inline fletcher-16 inverse-fletcher-16))
-#-(or)(defun fletcher-16 (a b byte)
+(defun fletcher-16 (a b byte)
   (declare (type (unsigned-byte 8) byte)
 	   (type (mod 255) a b))
   (setf
    a (mod (+ a byte) 255)
    b (mod (+ a b) 255))
   (values a b))
-#-(or)(defun inverse-fletcher-16 (a b window byte)
+(defun inverse-fletcher-16 (a b window byte)
   (declare (type (unsigned-byte 8) byte)
 	   (type (mod 255) a b)
-	   (type (mod 257) window)
+	   (type (mod 17) window)
 	   (optimize (safety 0) (speed 3) (debug 0)))
   (setf
    a
-   #+(or)(if (< a byte)
-	     (- a byte -255)
-	     (- a byte))
-   #-(or)(mod (- a byte -255) 255)
-   b (mod (- b (* byte window) +initial-a+ #.(* -255 257)) 255))
+   (mod (- a byte -255) 255)
+   b (mod (- b (* byte window) +initial-a+ #.(* -255 17)) 255))
   (values a b))
-(defconstant +exponent+ 255)
-#+(or)(defun fletcher-16 (a b byte)
-	(declare (ignore b)
-		 (type (mod 65536) a)
-		 (type (mod 256) b)(optimize (safety 0) (speed 3) (debug 0)))
-	(values (mod (+ (* a +exponent+) byte) #x10000) 0))
-#+(or)(defun inverse-fletcher-16 (a b window byte)
-	(declare (ignore b)
-		 (type (mod 65536) a)
-		 (type (mod 256) b)(optimize (safety 0) (speed 3) (debug 0)))
-	(values
-	 (mod (- a (mod (* byte (expt +exponent+ (1- window))) 65536)) 65536) 0))
-	
-
 
 (declaim (inline fast-peek-backwards))
 (declaim (type (function (fast-io::output-buffer fixnum) (values octet))
@@ -93,11 +75,14 @@
     (declare (type fixnum idx))
     (if (>= idx 0)
 	(aref (fast-io::output-buffer-vector buffer) idx) 
-	(loop for item of-type octet-vector in (reverse (fast-io::output-buffer-queue buffer))
-	   do (incf idx (length item))
-	   unless (< idx 0)
-	   return (aref item idx)))))
+	(or
+	 (loop for item of-type octet-vector in (reverse (fast-io::output-buffer-queue buffer))
+	    do (incf idx (length item))
+	    unless (< idx 0)
+	    return (aref item idx))
+	 (error "Unable to peek backwards")))))
 
+(setf fast-io:*default-output-buffer-size* +max-length+)
 
 (defun rolling (input)
   (declare (inline fast-read-byte))
@@ -105,26 +90,29 @@
   (with-fast-output (buffer)
     (handler-case
 	(let ((a +initial-a+)
-	      (b +initial-b+))
+	      (b +initial-b+)
+	      (buf (fast-io:make-octet-vector +min-length+)))
 	  (declare (type (unsigned-byte 8) a b))
-	  (loop repeat +min-length+
+	  (loop for i from 0 below +min-length+
 	     for byte = (faster-read-byte input)
 	       do
 	       (setf (values a b)
 		     (fletcher-16 a b byte))
-	       (fast-write-byte byte buffer))
-
+	       (fast-write-byte byte buffer)
+	       (setf (aref buf i) byte))
 	  (loop
-	     for count from 0
+	     for count from +min-length+
 	     for byte = (faster-read-byte input)
 	       do
 	       (setf (values a b) (inverse-fletcher-16 a b +min-length+
-						       (fast-peek-backwards buffer +min-length+))
+						       (aref buf (mod count +min-length+))
+						       #+(or)(fast-peek-backwards buffer +min-length+))
 		     (values a b) (fletcher-16 a b byte))
 	       (fast-write-byte byte buffer)
+	       (setf (aref buf (mod count +min-length+)) byte)
 	     until
 	       (or (= a b 0)
-		   (>= count +max-length+))))
+		   (>= count (1- +max-length+)))))
       (end-of-file ()))))
 
 
@@ -137,7 +125,7 @@
 	 (sqlite:execute-single *connection*
 				     "SELECT MAX(version) FROM files WHERE name=?"
 				     name)))
-    (declare (type (or null fixnum) version))
+    (declare (type (or null (unsigned-byte 64)) version))
     (if version
 	(1+ version)
 	1)))
@@ -202,10 +190,10 @@
     (sqlite:with-transaction *connection*
       (let ((length 0)
 	    (channel (lparallel:make-channel)))
-	(declare (type (unsigned-byte 64) length))
+	(declare (type fixnum length))
 	(loop
 	   with outstanding-tasks fixnum = 0
-	   for index from 0
+	   for index fixnum from 0
 	   for buf of-type octet-vector = (rolling input)
 	   unless (zerop (length buf))
 	   do
