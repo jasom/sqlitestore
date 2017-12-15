@@ -14,31 +14,47 @@
 ;;(defun compress (x) x)
 ;;(defun decompress (x) x)
 
-(declaim (optimize (speed 3)))
-(defconstant +buffer-size+ 1024)
+(declaim (optimize (debug 0) (speed 3)))
+;(declaim (optimize (debug 3)))
+#.(defconstant +buffer-size+ #x8000)
+(defconstant +buffer-size+ #x8000)
 
 (defstruct buffered-reader
   (buffer (fast-io:make-octet-vector +buffer-size+)
-	  :type fast-io:octet-vector )
+	  :type (simple-array octet (#.+buffer-size+)))
   (pos 0 :type fixnum)
   (fill 0 :type fixnum)
-  (stream nil :type fast-io:input-buffer))
+  (stream nil :type stream))
+
+(declaim (inline buffered-reader-fill-buffer))
+(defun buffered-reader-fill-buffer (in)
+  (symbol-macrolet ((fill (buffered-reader-fill in))
+		    (buffer (buffered-reader-buffer in))
+		    (stream (buffered-reader-stream in)))
+    (setf fill
+	  (mod
+	   (read-sequence buffer
+			  stream
+			  :start (mod fill +buffer-size+)
+			  :end (+ (mod fill +buffer-size+)
+				  (/ +buffer-size+ 2)))
+	   +buffer-size+))))
 
 (declaim (inline faster-read-byte))
 (defun faster-read-byte (in)
   (declare (type buffered-reader in))
-  (when (= (buffered-reader-fill in)
-	   (buffered-reader-pos in))
-    (setf (buffered-reader-fill in)
-	  (fast-read-sequence (buffered-reader-buffer in)
-			      (buffered-reader-stream in))
-	  (buffered-reader-pos in) 0))
-  (when (zerop (buffered-reader-fill in))
-    (error 'end-of-file))
-  (prog1
-      (aref (buffered-reader-buffer in)
-	    (buffered-reader-pos in))
-    (incf (buffered-reader-pos in))))
+  (symbol-macrolet ((pos  (buffered-reader-pos in))
+		    (fill (buffered-reader-fill in))
+		    (stream (buffered-reader-stream in))
+		    (buffer (buffered-reader-buffer in)))
+    (when (= fill pos)
+      (buffered-reader-fill-buffer in))
+    (when (= fill pos)
+      (error 'end-of-file))
+    (prog1
+	(aref buffer pos)
+      (setf pos
+	    (mod (1+ pos) +buffer-size+)))))
 	   
 
 (declaim (inline hash))
@@ -91,7 +107,7 @@
     (handler-case
 	(let ((a +initial-a+)
 	      (b +initial-b+)
-	      (buf (fast-io:make-octet-vector +min-length+)))
+	      #+sqlitestore::peek2(buf (fast-io:make-octet-vector +min-length+)))
 	  (declare (type (unsigned-byte 8) a b))
 	  (loop for i from 0 below +min-length+
 	     for byte = (faster-read-byte input)
@@ -99,17 +115,17 @@
 	       (setf (values a b)
 		     (fletcher-16 a b byte))
 	       (fast-write-byte byte buffer)
-	       (setf (aref buf i) byte))
+	       #+sqlitestore::peek2(setf (aref buf i) byte))
 	  (loop
 	     for count from +min-length+
 	     for byte = (faster-read-byte input)
 	       do
 	       (setf (values a b) (inverse-fletcher-16 a b +min-length+
-						       (aref buf (mod count +min-length+))
-						       #+(or)(fast-peek-backwards buffer +min-length+))
+						       #+sqlitestore::peek2(aref buf (mod count +min-length+))
+						       #-sqlitestore::peek2(fast-peek-backwards buffer +min-length+))
 		     (values a b) (fletcher-16 a b byte))
 	       (fast-write-byte byte buffer)
-	       (setf (aref buf (mod count +min-length+)) byte)
+	       #+sqlitestore::peek2(setf (aref buf (mod count +min-length+)) byte)
 	     until
 	       (or (= a b 0)
 		   (>= count (1- +max-length+)))))
@@ -215,7 +231,7 @@
   (loop
      while (< sofar size)
      for promise = (lparallel.queue:pop-queue queue)
-     for chunk = (lparallel:force promise)
+     for chunk of-type (or fast-io:octet-vector null) = (lparallel:force promise)
      unless chunk do (Error "Error fetching chunk:")
      sum (length chunk) into sofar
      do (fast-write-sequence chunk output)))
@@ -224,7 +240,7 @@
   (let ((length (sqlite:execute-single *connection*
 				       "SELECT size FROM files where id=?"
 				       file-id))
-	(queue (lparallel.queue:make-queue :fixed-capacity +chunk-pipeline-depth+))
+					(queue (lparallel.queue:make-queue :fixed-capacity +chunk-pipeline-depth+))
 	(channel (lparallel:make-channel)))
     ;; propagate errors up
     (lparallel:task-handler-bind ((null #'lparallel:invoke-transfer-error))
@@ -249,12 +265,17 @@
 (defun stdin-binary ()
   #+sbcl(sb-sys:make-fd-stream 0 :input t
 			       :element-type '(unsigned-byte 8))
-  #-sbcl(error "Implement stdin-binary for your implementation"))
+  #+ccl(ccl::make-fd-stream 0 :direction :input
+			   :element-type '(unsigned-byte 8))
+  #-(or sbcl ccl)(error "Implement stdin-binary for your implementation"))
 
 (defun stdout-binary ()
   #+sbcl(sb-sys:make-fd-stream 1 :output t
 			       :element-type '(unsigned-byte 8))
-  #-sbcl(error "Implement stdin-binary for your implementation"))
+  #+ccl(ccl::make-fd-stream 1 :direction :output
+			    :element-type '(unsigned-byte 8)
+			    :sharing :external)
+  #-(or ccl sbcl)(error "Implement stdin-binary for your implementation"))
 			       
 (defun create-command (dbpath)
   (let ((dbpath (uiop:parse-native-namestring dbpath)))
@@ -264,13 +285,13 @@
 (defun add-command (dbpath filename)
   (let ((dbpath (uiop:parse-native-namestring dbpath)))
     (sqlite:with-open-database (*connection* dbpath)
-      (fast-io:with-fast-input (stdin nil (stdin-binary))
-	(add-chunks
-	 (add-file filename)
-	 stdin)))))
+      (add-chunks
+       (add-file filename)
+       (stdin-binary)))))
 
 (defun restore-command (dbpath filename &optional version)
   (let ((dbpath (uiop:parse-native-namestring dbpath)))
+    (declare (optimize (speed 1)))
     (sqlite:with-open-database (*connection* dbpath)
       (let ((version
 	     (if version
@@ -283,6 +304,12 @@
 	(finish-output stdout-stream)))))
 
 
+(defun rolling-bench ()
+  (declare (optimize (speed 1)))
+  (let ((input (make-buffered-reader :stream (stdin-binary))))
+    (loop
+       until (zerop (length (rolling input))))))
+  
 (defun main ()
   ;; TODO be smart about chosing parallelism
   (setf lparallel:*kernel* (lparallel:make-kernel 16))
@@ -298,4 +325,5 @@
     (:add (apply #'add-command (cdr args)))
     (:create (apply #'create-command (cdr args)))
     (:restore (apply #'restore-command (cdr args)))
-    (t (error "Unknow command: ~S" (car args)))))
+    (:rolling-bench (apply #'rolling-bench (cdr args)))
+    (t (error "Unknown command: ~S" (car args)))))

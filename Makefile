@@ -1,8 +1,14 @@
 sqlitestore: *.lisp *.asd zstd/*.lisp
 	sbcl --disable-debugger --load build.lisp
 
+#sqlitestore: *.lisp *.asd zstd/*.lisp
+#	ccl -b -l build.lisp
+
+#sqlitestore: *.lisp *.asd zstd/*.lisp
+#	clisp -i build.lisp
+
 random.data:
-	head -c $((10*1024*1024)) /dev/urandom > random.data
+	head -c $$((10*1024*1024)) /dev/urandom > random.data
 
 double.data: random.data
 	cat random.data random.data > double.data
